@@ -1,7 +1,6 @@
 'use client'
 
 import { createContext, useContext, useEffect, useState, useCallback, ReactNode } from 'react'
-import { createClient } from '@/lib/supabase/client'
 import { SEED_PESTICIDES } from '@/lib/seed-pesticides'
 import type {
   Field, Season, Pesticide, SprayRecord, SprayRecordWithJoins,
@@ -9,8 +8,65 @@ import type {
   ToastMessage, ToastType,
 } from '@/types'
 
+// ── localStorage キー ───────────────────────────────────────
+const KEYS = {
+  fields:        'kyuri:fields',
+  seasons:       'kyuri:seasons',
+  pesticides:    'kyuri:pesticides',
+  sprayRecords:  'kyuri:spray_records',
+  seeded:        'kyuri:seeded',
+} as const
+
+const LOCAL_USER = 'local'
+
+// ── ユーティリティ ──────────────────────────────────────────
+function genId(): string {
+  return crypto.randomUUID()
+}
+
+function now(): string {
+  return new Date().toISOString()
+}
+
+function load<T>(key: string): T[] {
+  if (typeof window === 'undefined') return []
+  try {
+    const raw = localStorage.getItem(key)
+    return raw ? JSON.parse(raw) : []
+  } catch {
+    return []
+  }
+}
+
+function save<T>(key: string, data: T[]): void {
+  localStorage.setItem(key, JSON.stringify(data))
+}
+
+// SprayRecord + JOIN情報を結合して SprayRecordWithJoins を生成
+function joinRecords(
+  records: SprayRecord[],
+  fields: Field[],
+  seasons: Season[],
+  pesticides: Pesticide[],
+): SprayRecordWithJoins[] {
+  return records
+    .map((r) => {
+      const field = fields.find((f) => f.id === r.field_id)
+      const season = seasons.find((s) => s.id === r.season_id)
+      const pesticide = pesticides.find((p) => p.id === r.pesticide_id)
+      if (!field || !season || !pesticide) return null
+      return {
+        ...r,
+        fields:     { id: field.id, name: field.name },
+        seasons:    { id: season.id, name: season.name },
+        pesticides: { id: pesticide.id, name: pesticide.name, max_uses_per_season: pesticide.max_uses_per_season },
+      }
+    })
+    .filter(Boolean) as SprayRecordWithJoins[]
+}
+
+// ── Context 型 ──────────────────────────────────────────────
 interface AppContextValue {
-  // データ
   fields: Field[]
   seasons: Season[]
   pesticides: Pesticide[]
@@ -18,30 +74,24 @@ interface AppContextValue {
   recordsWithJoins: SprayRecordWithJoins[]
   loading: boolean
 
-  // 圃場CRUD
   createField: (input: CreateFieldInput) => Promise<Field | null>
   updateField: (id: string, input: Partial<CreateFieldInput>) => Promise<void>
   deleteField: (id: string) => Promise<void>
 
-  // 作期CRUD
   createSeason: (input: CreateSeasonInput) => Promise<Season | null>
   updateSeason: (id: string, input: Partial<CreateSeasonInput>) => Promise<void>
   deleteSeason: (id: string) => Promise<void>
 
-  // 農薬CRUD
   createPesticide: (input: CreatePesticideInput) => Promise<Pesticide | null>
   updatePesticide: (id: string, input: Partial<CreatePesticideInput>) => Promise<void>
   deletePesticide: (id: string) => Promise<void>
 
-  // 散布記録
   createSprayRecord: (input: CreateSprayRecordInput) => Promise<SprayRecord | null>
   deleteSprayRecord: (id: string) => Promise<void>
 
-  // ユーティリティ
   getRecentPesticides: () => Pesticide[]
   reload: () => Promise<void>
 
-  // トースト
   toasts: ToastMessage[]
   showToast: (message: string, type?: ToastType) => void
   dismissToast: (id: string) => void
@@ -49,16 +99,15 @@ interface AppContextValue {
 
 const AppContext = createContext<AppContextValue | null>(null)
 
+// ── Provider ────────────────────────────────────────────────
 export function AppProvider({ children }: { children: ReactNode }) {
-  const supabase = createClient()
-
-  const [fields, setFields] = useState<Field[]>([])
-  const [seasons, setSeasons] = useState<Season[]>([])
+  const [fields, setFields]       = useState<Field[]>([])
+  const [seasons, setSeasons]     = useState<Season[]>([])
   const [pesticides, setPesticides] = useState<Pesticide[]>([])
-  const [records, setRecords] = useState<SprayRecord[]>([])
+  const [records, setRecords]     = useState<SprayRecord[]>([])
   const [recordsWithJoins, setRecordsWithJoins] = useState<SprayRecordWithJoins[]>([])
-  const [loading, setLoading] = useState(true)
-  const [toasts, setToasts] = useState<ToastMessage[]>([])
+  const [loading, setLoading]     = useState(true)
+  const [toasts, setToasts]       = useState<ToastMessage[]>([])
 
   const showToast = useCallback((message: string, type: ToastType = 'info') => {
     const id = Date.now().toString()
@@ -70,146 +119,154 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setToasts((prev) => prev.filter((t) => t.id !== id))
   }, [])
 
+  // localStorageから全データ読み込み
   const loadAll = useCallback(async () => {
     setLoading(true)
-    const [fieldsRes, seasonsRes, pesticidesRes, recordsRes, recordsJoinRes] = await Promise.all([
-      supabase.from('fields').select('*').order('created_at'),
-      supabase.from('seasons').select('*').order('created_at'),
-      supabase.from('pesticides').select('*').order('created_at'),
-      supabase.from('spray_records').select('*').order('sprayed_at', { ascending: false }),
-      supabase
-        .from('spray_records')
-        .select('*, fields(id, name), seasons(id, name), pesticides(id, name, max_uses_per_season)')
-        .order('sprayed_at', { ascending: false }),
-    ])
 
-    if (fieldsRes.data) setFields(fieldsRes.data)
-    if (seasonsRes.data) setSeasons(seasonsRes.data)
-    if (pesticidesRes.data) setPesticides(pesticidesRes.data)
-    if (recordsRes.data) setRecords(recordsRes.data)
-    if (recordsJoinRes.data) setRecordsWithJoins(recordsJoinRes.data as SprayRecordWithJoins[])
+    // 初回のみ農薬マスターをシード登録
+    const seeded = localStorage.getItem(KEYS.seeded)
+    const savedPesticides = load<Pesticide>(KEYS.pesticides)
+    if (!seeded && savedPesticides.length === 0) {
+      const initial: Pesticide[] = SEED_PESTICIDES.map((p) => ({
+        id: genId(),
+        user_id: LOCAL_USER,
+        name: p.name,
+        registration_number: null,
+        max_uses_per_season: p.max_uses_per_season,
+        pre_harvest_interval_days: null,
+        memo: p.memo,
+        created_at: now(),
+        updated_at: now(),
+      }))
+      save(KEYS.pesticides, initial)
+      localStorage.setItem(KEYS.seeded, '1')
+      setPesticides(initial)
+    } else {
+      setPesticides(savedPesticides)
+    }
+
+    const f = load<Field>(KEYS.fields)
+    const s = load<Season>(KEYS.seasons)
+    const r = load<SprayRecord>(KEYS.sprayRecords)
+      .sort((a, b) => b.sprayed_at.localeCompare(a.sprayed_at))
+
+    setFields(f)
+    setSeasons(s)
+    setRecords(r)
+
+    const p = load<Pesticide>(KEYS.pesticides)
+    setRecordsWithJoins(joinRecords(r, f, s, p))
     setLoading(false)
   }, [])
 
-  // 初回ログイン時に農薬マスターをシード登録
-  const seedPesticidesIfEmpty = useCallback(async () => {
-    const { count } = await supabase
-      .from('pesticides')
-      .select('*', { count: 'exact', head: true })
-    if (count === 0) {
-      await supabase.from('pesticides').insert(
-        SEED_PESTICIDES.map((p) => ({
-          name: p.name,
-          memo: p.memo,
-          max_uses_per_season: p.max_uses_per_season,
-          registration_number: null,
-          pre_harvest_interval_days: null,
-        }))
-      )
-    }
-  }, [])
+  useEffect(() => { loadAll() }, [loadAll])
 
-  useEffect(() => {
-    loadAll().then(() => seedPesticidesIfEmpty()).then(() => loadAll())
-  }, [loadAll, seedPesticidesIfEmpty])
+  // 状態更新後に JOIN データも再生成するヘルパー
+  const refresh = (
+    f: Field[], s: Season[], p: Pesticide[], r: SprayRecord[]
+  ) => {
+    setFields(f); setSeasons(s); setPesticides(p); setRecords(r)
+    setRecordsWithJoins(joinRecords(r, f, s, p))
+  }
 
-  // 圃場
+  // ── 圃場 CRUD ──────────────────────────────────────────────
   const createField = async (input: CreateFieldInput): Promise<Field | null> => {
-    const { data, error } = await supabase.from('fields').insert(input).select().single()
-    if (error) { showToast('圃場の登録に失敗しました', 'error'); return null }
-    setFields((prev) => [...prev, data])
-    showToast(`「${data.name}」を登録しました`, 'success')
-    return data
+    const item: Field = { id: genId(), user_id: LOCAL_USER, ...input, created_at: now(), updated_at: now() }
+    const next = [...fields, item]
+    save(KEYS.fields, next)
+    refresh(next, seasons, pesticides, records)
+    showToast(`「${item.name}」を登録しました`, 'success')
+    return item
   }
 
   const updateField = async (id: string, input: Partial<CreateFieldInput>) => {
-    const { error } = await supabase.from('fields').update(input).eq('id', id)
-    if (error) { showToast('更新に失敗しました', 'error'); return }
-    setFields((prev) => prev.map((f) => (f.id === id ? { ...f, ...input } : f)))
+    const next = fields.map((f) => f.id === id ? { ...f, ...input, updated_at: now() } : f)
+    save(KEYS.fields, next)
+    refresh(next, seasons, pesticides, records)
     showToast('更新しました', 'success')
   }
 
   const deleteField = async (id: string) => {
-    const { error } = await supabase.from('fields').delete().eq('id', id)
-    if (error) { showToast('削除に失敗しました', 'error'); return }
-    setFields((prev) => prev.filter((f) => f.id !== id))
+    const next = fields.filter((f) => f.id !== id)
+    save(KEYS.fields, next)
+    refresh(next, seasons, pesticides, records)
     showToast('削除しました', 'success')
   }
 
-  // 作期
+  // ── 作期 CRUD ──────────────────────────────────────────────
   const createSeason = async (input: CreateSeasonInput): Promise<Season | null> => {
-    const { data, error } = await supabase.from('seasons').insert(input).select().single()
-    if (error) { showToast('作期の登録に失敗しました', 'error'); return null }
-    setSeasons((prev) => [...prev, data])
-    showToast(`「${data.name}」を登録しました`, 'success')
-    return data
+    const item: Season = { id: genId(), user_id: LOCAL_USER, ...input, created_at: now(), updated_at: now() }
+    const next = [...seasons, item]
+    save(KEYS.seasons, next)
+    refresh(fields, next, pesticides, records)
+    showToast(`「${item.name}」を登録しました`, 'success')
+    return item
   }
 
   const updateSeason = async (id: string, input: Partial<CreateSeasonInput>) => {
-    const { error } = await supabase.from('seasons').update(input).eq('id', id)
-    if (error) { showToast('更新に失敗しました', 'error'); return }
-    setSeasons((prev) => prev.map((s) => (s.id === id ? { ...s, ...input } : s)))
+    const next = seasons.map((s) => s.id === id ? { ...s, ...input, updated_at: now() } : s)
+    save(KEYS.seasons, next)
+    refresh(fields, next, pesticides, records)
     showToast('更新しました', 'success')
   }
 
   const deleteSeason = async (id: string) => {
-    const { error } = await supabase.from('seasons').delete().eq('id', id)
-    if (error) { showToast('削除に失敗しました', 'error'); return }
-    setSeasons((prev) => prev.filter((s) => s.id !== id))
+    const next = seasons.filter((s) => s.id !== id)
+    save(KEYS.seasons, next)
+    refresh(fields, next, pesticides, records)
     showToast('削除しました', 'success')
   }
 
-  // 農薬
+  // ── 農薬 CRUD ──────────────────────────────────────────────
   const createPesticide = async (input: CreatePesticideInput): Promise<Pesticide | null> => {
-    const { data, error } = await supabase.from('pesticides').insert(input).select().single()
-    if (error) { showToast('農薬の登録に失敗しました', 'error'); return null }
-    setPesticides((prev) => [...prev, data])
-    showToast(`「${data.name}」を登録しました`, 'success')
-    return data
+    const item: Pesticide = { id: genId(), user_id: LOCAL_USER, ...input, created_at: now(), updated_at: now() }
+    const next = [...pesticides, item]
+    save(KEYS.pesticides, next)
+    refresh(fields, seasons, next, records)
+    showToast(`「${item.name}」を登録しました`, 'success')
+    return item
   }
 
   const updatePesticide = async (id: string, input: Partial<CreatePesticideInput>) => {
-    const { error } = await supabase.from('pesticides').update(input).eq('id', id)
-    if (error) { showToast('更新に失敗しました', 'error'); return }
-    setPesticides((prev) => prev.map((p) => (p.id === id ? { ...p, ...input } : p)))
+    const next = pesticides.map((p) => p.id === id ? { ...p, ...input, updated_at: now() } : p)
+    save(KEYS.pesticides, next)
+    refresh(fields, seasons, next, records)
     showToast('更新しました', 'success')
   }
 
   const deletePesticide = async (id: string) => {
-    const { error } = await supabase.from('pesticides').delete().eq('id', id)
-    if (error) { showToast('削除に失敗しました', 'error'); return }
-    setPesticides((prev) => prev.filter((p) => p.id !== id))
+    const next = pesticides.filter((p) => p.id !== id)
+    save(KEYS.pesticides, next)
+    refresh(fields, seasons, next, records)
     showToast('削除しました', 'success')
   }
 
-  // 散布記録
+  // ── 散布記録 ───────────────────────────────────────────────
   const createSprayRecord = async (input: CreateSprayRecordInput): Promise<SprayRecord | null> => {
-    const { data, error } = await supabase.from('spray_records').insert(input).select().single()
-    if (error) { showToast('記録の保存に失敗しました', 'error'); return null }
-    // ローカル状態に追加後、JOINデータも再取得
-    setRecords((prev) => [data, ...prev])
-    await loadAll()
-    return data
+    const item: SprayRecord = { id: genId(), user_id: LOCAL_USER, ...input, created_at: now(), updated_at: now() }
+    const next = [item, ...records]
+    save(KEYS.sprayRecords, next)
+    refresh(fields, seasons, pesticides, next)
+    return item
   }
 
   const deleteSprayRecord = async (id: string) => {
-    const { error } = await supabase.from('spray_records').delete().eq('id', id)
-    if (error) { showToast('削除に失敗しました', 'error'); return }
-    setRecords((prev) => prev.filter((r) => r.id !== id))
-    setRecordsWithJoins((prev) => prev.filter((r) => r.id !== id))
+    const next = records.filter((r) => r.id !== id)
+    save(KEYS.sprayRecords, next)
+    refresh(fields, seasons, pesticides, next)
     showToast('削除しました', 'success')
   }
 
-  // 直近7日で使用した農薬（記録画面のショートカット用）
+  // 直近7日で使用した農薬（記録画面ショートカット用）
   const getRecentPesticides = useCallback((): Pesticide[] => {
-    const sevenDaysAgo = new Date()
-    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7)
-    const cutoff = sevenDaysAgo.toISOString().slice(0, 10)
+    const cutoff = new Date()
+    cutoff.setDate(cutoff.getDate() - 7)
+    const cutoffStr = cutoff.toISOString().slice(0, 10)
 
     const recentIds = [
       ...new Set(
         records
-          .filter((r) => r.sprayed_at >= cutoff)
+          .filter((r) => r.sprayed_at >= cutoffStr)
           .map((r) => r.pesticide_id)
       ),
     ].slice(0, 5)
@@ -220,18 +277,16 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [records, pesticides])
 
   return (
-    <AppContext.Provider
-      value={{
-        fields, seasons, pesticides, records, recordsWithJoins, loading,
-        createField, updateField, deleteField,
-        createSeason, updateSeason, deleteSeason,
-        createPesticide, updatePesticide, deletePesticide,
-        createSprayRecord, deleteSprayRecord,
-        getRecentPesticides,
-        reload: loadAll,
-        toasts, showToast, dismissToast,
-      }}
-    >
+    <AppContext.Provider value={{
+      fields, seasons, pesticides, records, recordsWithJoins, loading,
+      createField, updateField, deleteField,
+      createSeason, updateSeason, deleteSeason,
+      createPesticide, updatePesticide, deletePesticide,
+      createSprayRecord, deleteSprayRecord,
+      getRecentPesticides,
+      reload: loadAll,
+      toasts, showToast, dismissToast,
+    }}>
       {children}
       <ToastContainer toasts={toasts} onDismiss={dismissToast} />
     </AppContext.Provider>
@@ -249,15 +304,12 @@ function ToastContainer({ toasts, onDismiss }: { toasts: ToastMessage[]; onDismi
   return (
     <div className="fixed top-4 left-1/2 -translate-x-1/2 z-50 flex flex-col gap-2 w-[90vw] max-w-sm">
       {toasts.map((t) => (
-        <div
-          key={t.id}
-          onClick={() => onDismiss(t.id)}
+        <div key={t.id} onClick={() => onDismiss(t.id)}
           className={`px-4 py-3 rounded-xl shadow-lg text-sm font-medium cursor-pointer ${
             t.type === 'success' ? 'bg-emerald-600 text-white' :
             t.type === 'error'   ? 'bg-red-500 text-white' :
                                    'bg-gray-700 text-white'
-          }`}
-        >
+          }`}>
           {t.message}
         </div>
       ))}
