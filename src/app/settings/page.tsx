@@ -1,14 +1,23 @@
 'use client'
 
 import { useState } from 'react'
-import { Plus, Trash2, Pencil, Check, X } from 'lucide-react'
+import { useRouter } from 'next/navigation'
+import { LogOut, Plus, Trash2, Pencil, Check, X } from 'lucide-react'
+import { createClient } from '@/lib/supabase/client'
 import { useApp } from '@/context/AppContext'
 import type { Field, Season, Pesticide } from '@/types'
 
 type Tab = 'fields' | 'seasons' | 'pesticides'
 
 export default function SettingsPage() {
+  const router = useRouter()
   const [tab, setTab] = useState<Tab>('fields')
+
+  const handleLogout = async () => {
+    const supabase = createClient()
+    await supabase.auth.signOut()
+    router.push('/auth/login')
+  }
 
   const tabs: { id: Tab; label: string }[] = [
     { id: 'fields', label: '圃場' },
@@ -20,8 +29,12 @@ export default function SettingsPage() {
     <div className="pb-24 min-h-screen">
       {/* ヘッダー */}
       <div className="bg-emerald-600 text-white px-4 pt-12 pb-5">
-        <h1 className="text-xl font-bold">設定</h1>
-        <p className="text-emerald-100 text-sm mt-0.5">圃場・作期・農薬の管理</p>
+        <div className="flex items-center justify-between">
+          <h1 className="text-xl font-bold">設定</h1>
+          <button onClick={handleLogout} className="flex items-center gap-1 text-emerald-100 text-sm">
+            <LogOut size={16} /> ログアウト
+          </button>
+        </div>
       </div>
 
       {/* タブ */}
